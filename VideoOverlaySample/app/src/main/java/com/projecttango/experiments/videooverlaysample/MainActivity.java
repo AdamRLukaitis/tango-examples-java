@@ -28,7 +28,9 @@ import com.google.atap.tangoservice.TangoCameraIntrinsics;
 import com.google.atap.tangoservice.TangoCameraPreview;
 import com.google.atap.tangoservice.TangoConfig;
 import com.google.atap.tangoservice.TangoCoordinateFramePair;
+import com.google.atap.tangoservice.TangoErrorException;
 import com.google.atap.tangoservice.TangoEvent;
+import com.google.atap.tangoservice.TangoOutOfDateException;
 import com.google.atap.tangoservice.TangoPoseData;
 import com.google.atap.tangoservice.TangoXyzIjData;
 
@@ -39,39 +41,20 @@ import com.google.atap.tangoservice.TangoXyzIjData;
  * context and connect to the camera we want by using connectToTangoCamera class.Once the connection 
  * is established we need to manually update the TangoCameraPreview's texture by using the
  * onFrameAvailable callbacks.
- * Note:
- * To use TangoCameraPreview class we need to ask the user permissions for MotionTracking 
- * at the minimum level. This is because in Java all the call backs such as 
- * onPoseAvailable,onXyzIjAvailable, onTangoEvents, onFrameAvailable are set together at once. 
+ * NOTE: It is important to declare the CAMERA permission in the Android Manifest to access
+ * the device camera.
  */
 public class MainActivity extends Activity {
 	private TangoCameraPreview tangoCameraPreview;
 	private Tango mTango;
+	private boolean mIsConnected;
 
 	@Override
 	protected void onCreate(Bundle savedInstanceState) {
 		super.onCreate(savedInstanceState);
 		tangoCameraPreview = new TangoCameraPreview(this);
 		mTango = new Tango(this);
-		startActivityForResult(
-				Tango.getRequestPermissionIntent(Tango.PERMISSIONTYPE_MOTION_TRACKING),
-				Tango.TANGO_INTENT_ACTIVITYCODE);
 		setContentView(tangoCameraPreview);
-	}
-
-	@Override
-	protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-		// Check which request we're responding to
-		if (requestCode == Tango.TANGO_INTENT_ACTIVITYCODE) {
-			// Make sure the request was successful
-			if (resultCode == RESULT_CANCELED) {
-				Toast.makeText(this, "Motion Tracking Permissions Required!",
-						Toast.LENGTH_SHORT).show();
-				finish();
-			} else {
-				startCameraPreview();
-			}
-		}
 	}
 
 	// Camera Preview
@@ -82,8 +65,9 @@ public class MainActivity extends Activity {
 		// Use default configuration for Tango Service.
 		TangoConfig config = mTango.getConfig(TangoConfig.CONFIG_TYPE_DEFAULT);
 		mTango.connect(config);
-		
-		// No need to add any coordinate frame pairs since we are not using 
+		mIsConnected = true;
+
+		// No need to add any coordinate frame pairs since we are not using
 		// pose data. So just initialize.
 		ArrayList<TangoCoordinateFramePair> framePairs = new ArrayList<TangoCoordinateFramePair>();
 		mTango.connectListener(framePairs, new OnTangoUpdateListener() {
@@ -94,7 +78,7 @@ public class MainActivity extends Activity {
 
 			@Override
 			public void onFrameAvailable(int cameraId) {
-			    
+
 			    // Check if the frame available is for the camera we want and
 			    // update its frame on the camera preview.
 				if (cameraId == TangoCameraIntrinsics.TANGO_CAMERA_COLOR) {
@@ -117,6 +101,25 @@ public class MainActivity extends Activity {
 	@Override
 	protected void onPause() {
 		super.onPause();
-		mTango.disconnect();
+		if(mIsConnected) {
+			mTango.disconnect();
+			tangoCameraPreview.disconnectFromTangoCamera();
+			mIsConnected = false;
+		}
+	}
+
+	@Override
+	protected void onResume() {
+		super.onResume();
+		try {
+			if (!mIsConnected) {
+				startCameraPreview();
+			}
+		} catch (TangoOutOfDateException e) {
+			Toast.makeText(getApplicationContext(), R.string.TangoOutOfDateException,
+					Toast.LENGTH_SHORT).show();
+		} catch (TangoErrorException e) {
+			Toast.makeText(getApplicationContext(), R.string.TangoError, Toast.LENGTH_SHORT).show();
+		}
 	}
 }

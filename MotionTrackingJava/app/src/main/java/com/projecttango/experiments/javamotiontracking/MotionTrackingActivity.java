@@ -30,7 +30,6 @@ import android.app.Activity;
 import android.content.Intent;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager.NameNotFoundException;
-import android.opengl.GLSurfaceView;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.MotionEvent;
@@ -39,18 +38,26 @@ import android.widget.Button;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import com.projecttango.tangoutils.TangoPoseUtilities;
+
+import org.rajawali3d.surface.IRajawaliSurface;
+import org.rajawali3d.surface.RajawaliSurfaceView;
+
 import java.text.DecimalFormat;
 import java.util.ArrayList;
 
 /**
  * Main Activity class for the Motion Tracking API Sample. Handles the connection to the Tango
  * service and propagation of Tango pose data to OpenGL and Layout views. OpenGL rendering logic is
- * delegated to the {@link MTGLRenderer} class.
+ * delegated to the {@link MotionTrackingRajawaliRenderer} class.
  */
 public class MotionTrackingActivity extends Activity implements View.OnClickListener {
 
     private static final String TAG = MotionTrackingActivity.class.getSimpleName();
     private static final int SECS_TO_MILLISECS = 1000;
+    private static final double UPDATE_INTERVAL_MS = 100.0f;
+    private static final DecimalFormat FORMAT_THREE_DECIMAL = new DecimalFormat("0.000");
+
     private Tango mTango;
     private TangoConfig mConfig;
     private TextView mDeltaTextView;
@@ -62,17 +69,16 @@ public class MotionTrackingActivity extends Activity implements View.OnClickList
     private TextView mApplicationVersionTextView;
     private TextView mTangoEventTextView;
     private Button mMotionResetButton;
-    private float mPreviousTimeStamp;
-    private int mPreviousPoseStatus;
-    private int count;
-    private float mDeltaTime;
     private boolean mIsAutoRecovery;
-    private MTGLRenderer mRenderer;
-    private GLSurfaceView mGLView;
-    private boolean mIsProcessing = false;
-    private TangoPoseData mPose;
-    private static final int UPDATE_INTERVAL_MS = 100;
-    public static Object sharedLock = new Object();
+    private MotionTrackingRajawaliRenderer mRenderer;
+
+    // State tracking variables for pose callback handler.  If these are
+    // referenced from the main thread, they need to be synchronized with the
+    // pose handler callback.
+    private double mPreviousTimeStamp = 0.0;
+    private int mPreviousPoseStatus = TangoPoseData.POSE_INVALID;
+    private int mCount = 0;
+    private double mTimeToNextUpdate = UPDATE_INTERVAL_MS;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -81,12 +87,48 @@ public class MotionTrackingActivity extends Activity implements View.OnClickList
         Intent intent = getIntent();
         mIsAutoRecovery = intent.getBooleanExtra(StartActivity.KEY_MOTIONTRACKING_AUTORECOVER,
                 false);
+        // Instantiate the Tango service
+        mTango = new Tango(this);
+        mConfig = setupTangoConfig(mTango, mIsAutoRecovery);
+        setupTextViewsAndButtons(mConfig);
+        mRenderer = setupGLViewAndRenderer();
+    }
+
+    /**
+     * Sets Rajawalisurface view and its renderer. This is ideally called only once in onCreate.
+     */
+    private MotionTrackingRajawaliRenderer setupGLViewAndRenderer(){
+
+        // Configure OpenGL renderer
+        MotionTrackingRajawaliRenderer renderer = new MotionTrackingRajawaliRenderer(this);
+        // OpenGL view where all of the graphics are drawn
+        RajawaliSurfaceView glView = (RajawaliSurfaceView) findViewById(R.id.gl_surface_view);
+        glView.setEGLContextClientVersion(2);
+        glView.setRenderMode(IRajawaliSurface.RENDERMODE_CONTINUOUSLY);
+        glView.setSurfaceRenderer(renderer);
+        return renderer;
+
+    }
+
+    /**
+     * Sets Texts views to display statistics of Poses being received. This also sets the buttons
+     * used in the UI. Please note that this needs to be called after TangoService and Config
+     * objects are initialized since we use them for the SDK related stuff like version number
+     * etc.
+     */
+    private void setupTextViewsAndButtons(TangoConfig config){
         // Text views for displaying translation and rotation data
         mPoseTextView = (TextView) findViewById(R.id.pose);
         mQuatTextView = (TextView) findViewById(R.id.quat);
         mPoseCountTextView = (TextView) findViewById(R.id.posecount);
         mDeltaTextView = (TextView) findViewById(R.id.deltatime);
         mTangoEventTextView = (TextView) findViewById(R.id.tangoevent);
+
+        // Text views for the status of the pose data and Tango library versions
+        mPoseStatusTextView = (TextView) findViewById(R.id.status);
+        mTangoServiceVersionTextView = (TextView) findViewById(R.id.version);
+        mApplicationVersionTextView = (TextView) findViewById(R.id.appversion);
+
         // Buttons for selecting camera view and Set up button click listeners
         findViewById(R.id.first_person_button).setOnClickListener(this);
         findViewById(R.id.third_person_button).setOnClickListener(this);
@@ -94,42 +136,11 @@ public class MotionTrackingActivity extends Activity implements View.OnClickList
 
         // Button to reset motion tracking
         mMotionResetButton = (Button) findViewById(R.id.resetmotion);
-
-        // Text views for the status of the pose data and Tango library versions
-        mPoseStatusTextView = (TextView) findViewById(R.id.status);
-        mTangoServiceVersionTextView = (TextView) findViewById(R.id.version);
-        mApplicationVersionTextView = (TextView) findViewById(R.id.appversion);
-
-        // OpenGL view where all of the graphics are drawn
-        mGLView = (GLSurfaceView) findViewById(R.id.gl_surface_view);
-
         // Set up button click listeners
         mMotionResetButton.setOnClickListener(this);
 
-        // Configure OpenGL renderer
-        mRenderer = new MTGLRenderer();
-        mGLView.setEGLContextClientVersion(2);
-        mGLView.setRenderer(mRenderer);
-
-        // Instantiate the Tango service
-        mTango = new Tango(this);
-        // Create a new Tango Configuration and enable the MotionTrackingActivity API
-        mConfig = new TangoConfig();
-        mConfig = mTango.getConfig(TangoConfig.CONFIG_TYPE_CURRENT);
-        mConfig.putBoolean(TangoConfig.KEY_BOOLEAN_MOTIONTRACKING, true);
-
-        // The Auto-Recovery ToggleButton sets a boolean variable to determine
-        // if the
-        // Tango service should automatically attempt to recover when
-        // / MotionTrackingActivity enters an invalid state.
-        if (mIsAutoRecovery) {
-            mConfig.putBoolean(TangoConfig.KEY_BOOLEAN_AUTORECOVERY, true);
-            Log.i(TAG, "Auto Reset On");
-        } else {
-            mConfig.putBoolean(TangoConfig.KEY_BOOLEAN_AUTORECOVERY, false);
-            Log.i(TAG, "Auto Reset Off");
-        }
-
+        // Display the library version for debug purposes
+        mTangoServiceVersionTextView.setText(config.getString("tango_service_library_version"));
         PackageInfo packageInfo;
         try {
             packageInfo = this.getPackageManager().getPackageInfo(this.getPackageName(), 0);
@@ -137,14 +148,29 @@ public class MotionTrackingActivity extends Activity implements View.OnClickList
         } catch (NameNotFoundException e) {
             e.printStackTrace();
         }
-
-        // Display the library version for debug purposes
-        mTangoServiceVersionTextView.setText(mConfig.getString("tango_service_library_version"));
-        startUIThread();
     }
 
     /**
-     * Set up the TangoConfig and the listeners for the Tango service, then begin using the Motion
+     * Sets up the tango configuration object. Make sure mTango object is initialized before
+     * making this call.
+     */
+    private TangoConfig setupTangoConfig(Tango tango, boolean isAutoRecovery){
+        // Create a new Tango Configuration and enable the MotionTrackingActivity API
+        TangoConfig config = new TangoConfig();
+        config = tango.getConfig(config.CONFIG_TYPE_CURRENT);
+        config.putBoolean(TangoConfig.KEY_BOOLEAN_MOTIONTRACKING, true);
+
+        // The Auto-Recovery ToggleButton sets a boolean variable to determine
+        // if the
+        // Tango service should automatically attempt to recover when
+        // / MotionTrackingActivity enters an invalid state.
+        config.putBoolean(TangoConfig.KEY_BOOLEAN_AUTORECOVERY, isAutoRecovery);
+        Log.i(TAG, "Auto Reset: " + mIsAutoRecovery);
+        return  config;
+    }
+
+    /**
+     * Set up the callback listeners for the Tango service, then begin using the Motion
      * Tracking API. This is called in response to the user clicking the 'Start' Button.
      */
     private void setTangoListeners() {
@@ -154,36 +180,66 @@ public class MotionTrackingActivity extends Activity implements View.OnClickList
         framePairs.add(new TangoCoordinateFramePair(
                 TangoPoseData.COORDINATE_FRAME_START_OF_SERVICE,
                 TangoPoseData.COORDINATE_FRAME_DEVICE));
+
         // Listen for new Tango data
         mTango.connectListener(framePairs, new OnTangoUpdateListener() {
-
             @Override
             public void onPoseAvailable(final TangoPoseData pose) {
-                //Make sure to have atomic access to Tango Pose Data so that
-                //render loop doesn't interfere while Pose call back is updating
-                // the data.
-                synchronized (sharedLock) {
-                    mPose = pose;
-                    mDeltaTime = (float) (pose.timestamp - mPreviousTimeStamp) * SECS_TO_MILLISECS;
-                    mPreviousTimeStamp = (float) pose.timestamp;
-                    // Log whenever Motion Tracking enters an invalid state
-                    if (!mIsAutoRecovery && (pose.statusCode == TangoPoseData.POSE_INVALID)) {
-                        Log.w(TAG, "Invalid State");
-                    }
-                    if (mPreviousPoseStatus != pose.statusCode) {
-                        count = 0;
-                    }
-                    count++;
-                    mPreviousPoseStatus = pose.statusCode;
-                    // Update the OpenGL renderable objects with the new Tango Pose
-                    // data
-                    float[] translation = pose.getTranslationAsFloats();
-                    if(!mRenderer.isValid()){
-                        return;
-                    }
-                    mRenderer.getTrajectory().updateTrajectory(translation);
-                    mRenderer.getModelMatCalculator().updateModelMatrix(translation,
-                            pose.getRotationAsFloats());
+                // Update the OpenGL renderable objects with the new Tango Pose
+                // data.  Note that locking for thread safe access with the
+                // OpenGL loop is done entirely in the renderer.
+                mRenderer.updateDevicePose(pose);
+
+                // Now lets log some interesting statistics of Motion Tracking
+                // like Delta Time between two Poses, number of poses since the
+                // initialization state.
+                final double deltaTime = (pose.timestamp - mPreviousTimeStamp)
+                    * SECS_TO_MILLISECS;
+
+                mPreviousTimeStamp = pose.timestamp;
+                // Log whenever Motion Tracking enters an invalid state
+                if (!mIsAutoRecovery && (pose.statusCode == TangoPoseData.POSE_INVALID)) {
+                    Log.w(TAG, "Invalid State");
+                }
+                if (mPreviousPoseStatus != pose.statusCode) {
+                    mCount = 0;
+                }
+                mCount++;
+                final int count = mCount;
+                mPreviousPoseStatus = pose.statusCode;
+
+                // Throttle updates to the UI based on UPDATE_INTERVAL_MS.
+                mTimeToNextUpdate -= deltaTime;
+                boolean updateUI = false;
+                if(mTimeToNextUpdate < 0.0) {
+                    mTimeToNextUpdate = UPDATE_INTERVAL_MS;
+                    updateUI = true;
+                }
+
+                // If the pose is not valid, we may not get another callback so make sure to update
+                // the UI during this call
+                if (pose.statusCode != TangoPoseData.POSE_VALID) {
+                    updateUI = true;
+                }
+
+                if(updateUI) {
+                    final String translationString =
+                        TangoPoseUtilities.getTranslationString(pose, FORMAT_THREE_DECIMAL);
+                    final String quaternionString =
+                        TangoPoseUtilities.getQuaternionString(pose, FORMAT_THREE_DECIMAL);
+                    final String status = TangoPoseUtilities.getStatusString(pose);
+
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            // Display pose data on screen in TextViews.
+                            mPoseTextView.setText(translationString);
+                            mQuatTextView.setText(quaternionString);
+                            mPoseCountTextView.setText(Integer.toString(count));
+                            mDeltaTextView.setText(FORMAT_THREE_DECIMAL.format(deltaTime));
+                            mPoseStatusTextView.setText(status);
+                        }
+                    });
                 }
             }
 
@@ -209,6 +265,11 @@ public class MotionTrackingActivity extends Activity implements View.OnClickList
         });
     }
 
+    /**
+     * Reset motion tracking to last known valid pose. Once this function is called,
+     * Motion Tracking restarts as such we may get initializing poses again. Developer should make
+     * sure that user gets enough feed back in that case.
+     */
     private void motionReset() {
         mTango.resetMotionTracking();
     }
@@ -223,6 +284,7 @@ public class MotionTrackingActivity extends Activity implements View.OnClickList
         }
     }
 
+    @Override
     protected void onResume() {
         super.onResume();
         try {
@@ -241,14 +303,6 @@ public class MotionTrackingActivity extends Activity implements View.OnClickList
         } catch (TangoErrorException e) {
             Toast.makeText(getApplicationContext(), R.string.TangoError, Toast.LENGTH_SHORT).show();
         }
-        try {
-            setUpExtrinsics();
-        } catch (TangoErrorException e) {
-            Toast.makeText(getApplicationContext(), R.string.TangoError, Toast.LENGTH_SHORT).show();
-        } catch (SecurityException e) {
-            Toast.makeText(getApplicationContext(), R.string.motiontrackingpermission,
-                    Toast.LENGTH_SHORT).show();
-        }
     }
 
     @Override
@@ -259,109 +313,27 @@ public class MotionTrackingActivity extends Activity implements View.OnClickList
     @Override
     public void onClick(View v) {
         switch (v.getId()) {
-        case R.id.first_person_button:
-            mRenderer.setFirstPersonView();
-            break;
-        case R.id.top_down_button:
-            mRenderer.setTopDownView();
-            break;
-        case R.id.third_person_button:
-            mRenderer.setThirdPersonView();
-            break;
-        case R.id.resetmotion:
-            motionReset();
-            break;
-        default:
-            Log.w(TAG, "Unknown button click");
-            return;
+            case R.id.first_person_button:
+                mRenderer.setFirstPersonView();
+                break;
+            case R.id.top_down_button:
+                mRenderer.setTopDownView();
+                break;
+            case R.id.third_person_button:
+                mRenderer.setThirdPersonView();
+                break;
+            case R.id.resetmotion:
+                motionReset();
+                break;
+            default:
+                Log.w(TAG, "Unknown button click");
+                return;
         }
     }
 
     @Override
     public boolean onTouchEvent(MotionEvent event) {
-        return mRenderer.onTouchEvent(event);
-    }
-    
-    /**
-     * Setup the extrinsics of the device.
-     */
-    private void setUpExtrinsics() {
-        // Get device to imu matrix.
-        TangoPoseData device2IMUPose = new TangoPoseData();
-        TangoCoordinateFramePair framePair = new TangoCoordinateFramePair();
-        framePair.baseFrame = TangoPoseData.COORDINATE_FRAME_IMU;
-        framePair.targetFrame = TangoPoseData.COORDINATE_FRAME_DEVICE;
-        device2IMUPose = mTango.getPoseAtTime(0.0, framePair);
-        mRenderer.getModelMatCalculator().SetDevice2IMUMatrix(
-                device2IMUPose.getTranslationAsFloats(), device2IMUPose.getRotationAsFloats());
-
-        // Get color camera to imu matrix.
-        TangoPoseData color2IMUPose = new TangoPoseData();
-        framePair.baseFrame = TangoPoseData.COORDINATE_FRAME_IMU;
-        framePair.targetFrame = TangoPoseData.COORDINATE_FRAME_CAMERA_COLOR;
-        color2IMUPose = mTango.getPoseAtTime(0.0, framePair);
-
-        mRenderer.getModelMatCalculator().SetColorCamera2IMUMatrix(
-                color2IMUPose.getTranslationAsFloats(), color2IMUPose.getRotationAsFloats());
-    }
-    /**
-     * Create a separate thread to update Log information on UI at the specified
-     * interval of UPDATE_INTERVAL_MS. This function also makes sure to have access
-     * to the mPose atomically.
-     */
-    private void startUIThread() {
-        new Thread(new Runnable() {
-            DecimalFormat threeDec = new DecimalFormat("00.000");
-            @Override
-            public void run() {
-                while (true) {
-                    try {
-                        Thread.sleep(UPDATE_INTERVAL_MS);
-                        runOnUiThread(new Runnable() {
-                            @Override
-                            public void run() {
-                                try {
-                                    synchronized (sharedLock) {
-                                        if (mPose == null) {
-                                            return;
-                                        }
-                                       
-                                        String translationString = "["
-                                                + threeDec.format(mPose.translation[0]) + ", "
-                                                + threeDec.format(mPose.translation[1]) + ", "
-                                                + threeDec.format(mPose.translation[2]) + "] ";
-                                        String quaternionString = "["
-                                                + threeDec.format(mPose.rotation[0]) + ", "
-                                                + threeDec.format(mPose.rotation[1]) + ", "
-                                                + threeDec.format(mPose.rotation[2]) + ", "
-                                                + threeDec.format(mPose.rotation[3]) + "] ";
-
-                                        // Display pose data on screen in TextViews
-                                        mPoseTextView.setText(translationString);
-                                        mQuatTextView.setText(quaternionString);
-                                        mPoseCountTextView.setText(Integer.toString(count));
-                                        mDeltaTextView.setText(threeDec.format(mDeltaTime));
-                                        if (mPose.statusCode == TangoPoseData.POSE_VALID) {
-                                            mPoseStatusTextView.setText(R.string.pose_valid);
-                                        } else if (mPose.statusCode == TangoPoseData.POSE_INVALID) {
-                                            mPoseStatusTextView.setText(R.string.pose_invalid);
-                                        } else if (mPose.statusCode == TangoPoseData.POSE_INITIALIZING) {
-                                            mPoseStatusTextView.setText(R.string.pose_initializing);
-                                        } else if (mPose.statusCode == TangoPoseData.POSE_UNKNOWN) {
-                                            mPoseStatusTextView.setText(R.string.pose_unknown);
-                                        }
-                                    }
-                                } catch (NullPointerException e) {
-                                    e.printStackTrace();
-                                }
-                            }
-                        });
-
-                    } catch (InterruptedException e) {
-                        e.printStackTrace();
-                    }
-                }
-            }
-        }).start();
+        mRenderer.onTouchEvent(event);
+        return true;
     }
 }

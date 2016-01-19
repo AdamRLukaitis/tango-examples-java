@@ -16,6 +16,9 @@
 
 package com.projecttango.experiments.javapointcloud;
 
+import com.google.atap.tango.ux.TangoUx;
+import com.google.atap.tango.ux.TangoUx.StartParams;
+import com.google.atap.tango.ux.TangoUxLayout;
 import com.google.atap.tango.ux.UxExceptionEvent;
 import com.google.atap.tango.ux.UxExceptionEventListener;
 import com.google.atap.tangoservice.Tango;
@@ -24,20 +27,13 @@ import com.google.atap.tangoservice.TangoConfig;
 import com.google.atap.tangoservice.TangoCoordinateFramePair;
 import com.google.atap.tangoservice.TangoErrorException;
 import com.google.atap.tangoservice.TangoEvent;
-import com.google.atap.tangoservice.TangoInvalidException;
 import com.google.atap.tangoservice.TangoOutOfDateException;
 import com.google.atap.tangoservice.TangoPoseData;
 import com.google.atap.tangoservice.TangoXyzIjData;
 
-import com.google.atap.tango.ux.TangoUx;
-import com.google.atap.tango.ux.TangoUxLayout;
-
-
 import android.app.Activity;
-import android.content.Intent;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager.NameNotFoundException;
-import android.opengl.GLSurfaceView;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.MotionEvent;
@@ -47,25 +43,40 @@ import android.widget.Button;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.io.FileInputStream;
-import java.io.IOException;
+import com.projecttango.tangosupport.TangoPointCloudManager;
+import com.projecttango.tangoutils.TangoPoseUtilities;
+
+import org.rajawali3d.scene.ASceneFrameCallback;
+import org.rajawali3d.surface.RajawaliSurfaceView;
+
+import java.lang.Override;
+import java.nio.FloatBuffer;
 import java.text.DecimalFormat;
 import java.util.ArrayList;
 
 /**
  * Main Activity class for the Point Cloud Sample. Handles the connection to the {@link Tango}
  * service and propagation of Tango XyzIj data to OpenGL and Layout views. OpenGL rendering logic is
- * delegated to the {@link PCrenderer} class.
+ * delegated to the {@link PointCloudRajawaliRenderer} class.
  */
 public class PointCloudActivity extends Activity implements OnClickListener {
 
     private static final String TAG = PointCloudActivity.class.getSimpleName();
     private static final int SECS_TO_MILLISECS = 1000;
+
+    // Configure the Tango coordinate frame pair
+    private static final ArrayList<TangoCoordinateFramePair> FRAME_PAIRS =
+            new ArrayList<TangoCoordinateFramePair>();
+    {
+        FRAME_PAIRS.add(new TangoCoordinateFramePair(
+                TangoPoseData.COORDINATE_FRAME_START_OF_SERVICE,
+                TangoPoseData.COORDINATE_FRAME_DEVICE));
+    }
+
     private Tango mTango;
     private TangoConfig mConfig;
 
-    private PCRenderer mRenderer;
-    private GLSurfaceView mGLView;
+    private PointCloudRajawaliRenderer mRenderer;
 
     private TextView mDeltaTextView;
     private TextView mPoseCountTextView;
@@ -83,72 +94,20 @@ public class PointCloudActivity extends Activity implements OnClickListener {
     private Button mThirdPersonButton;
     private Button mTopDownButton;
 
-    private int count;
-    private int mPreviousPoseStatus;
-    private int mPointCount;
-    private float mDeltaTime;
-    private float mPosePreviousTimeStamp;
-    private float mXyIjPreviousTimeStamp;
-    private float mCurrentTimeStamp;
-    private float mPointCloudFrameDelta;
-    private String mServiceVersion;
+    private int mCount;
+    private int mPreviousPoseStatus = TangoPoseData.POSE_INVALID;
+    private double mPosePreviousTimeStamp;
+    private double mXyIjPreviousTimeStamp;
     private boolean mIsTangoServiceConnected;
     private TangoPoseData mPose;
-
+    private TangoPointCloudManager mPointCloudManager;
     private TangoUx mTangoUx;
-    private TangoUxLayout mTangoUxLayout;
 
-    private static final int UPDATE_INTERVAL_MS = 100;
-    public static Object poseLock = new Object();
-    public static Object depthLock = new Object();
+    private static final DecimalFormat FORMAT_THREE_DECIMAL = new DecimalFormat("0.000");
+    private static final double UPDATE_INTERVAL_MS = 100.0;
 
-
-    /*
-     * This is an advanced way of using UX exceptions. In most cases developers can just use the in
-     * built exception notifications using the Ux Exception layout. In case a developer doesn't want
-     * to use the default Ux Exception notifications, he can set the UxException listener as shown
-     * below.
-     * In this example we are just logging all the ux exceptions to logcat, but in a real app,
-     * developers should use these exceptions to contextually notify the user and help direct the
-     * user in using the device in a way Tango service expects it.
-     */
-    private UxExceptionEventListener mUxExceptionListener = new UxExceptionEventListener() {
-
-        @Override
-        public void onUxExceptionEvent(UxExceptionEvent uxExceptionEvent) {
-            if(uxExceptionEvent.getType() == UxExceptionEvent.TYPE_LYING_ON_SURFACE){
-                Log.i(TAG, "Device lying on surface ");
-            }
-            if(uxExceptionEvent.getType() == UxExceptionEvent.TYPE_FEW_DEPTH_POINTS){
-                Log.i(TAG, "Very few depth points in point cloud " );
-            }
-            if(uxExceptionEvent.getType() == UxExceptionEvent.TYPE_FEW_FEATURES){
-                Log.i(TAG, "Invalid poses in MotionTracking ");
-            }
-            if(uxExceptionEvent.getType() == UxExceptionEvent.TYPE_INCOMPATIBLE_VM){
-                Log.i(TAG, "Device not running on ART");
-            }
-            if(uxExceptionEvent.getType() == UxExceptionEvent.TYPE_MOTION_TRACK_INVALID){
-                Log.i(TAG, "Invalid poses in MotionTracking ");
-            }
-            if(uxExceptionEvent.getType() == UxExceptionEvent.TYPE_MOVING_TOO_FAST){
-                Log.i(TAG, "Invalid poses in MotionTracking ");
-            }
-            if(uxExceptionEvent.getType() == UxExceptionEvent.TYPE_OVER_EXPOSED){
-                Log.i(TAG, "Camera Over Exposed");
-            }
-            if(uxExceptionEvent.getType() == UxExceptionEvent.TYPE_TANGO_SERVICE_NOT_RESPONDING){
-                Log.i(TAG, "TangoService is not responding ");
-            }
-            if(uxExceptionEvent.getType() == UxExceptionEvent.TYPE_TANGO_UPDATE_NEEDED){
-                Log.i(TAG, "Device not running on ART");
-            }
-            if(uxExceptionEvent.getType() == UxExceptionEvent.TYPE_UNDER_EXPOSED){
-                Log.i(TAG, "Camera Under Exposed " );
-            }
-
-        }
-    };
+    private double mPoseTimeToNextUpdate = UPDATE_INTERVAL_MS;
+    private double mXyzIjTimeToNextUpdate = UPDATE_INTERVAL_MS;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -156,54 +115,14 @@ public class PointCloudActivity extends Activity implements OnClickListener {
         setContentView(R.layout.activity_jpoint_cloud);
         setTitle(R.string.app_name);
 
-        mPoseTextView = (TextView) findViewById(R.id.pose);
-        mQuatTextView = (TextView) findViewById(R.id.quat);
-        mPoseCountTextView = (TextView) findViewById(R.id.posecount);
-        mDeltaTextView = (TextView) findViewById(R.id.deltatime);
-        mTangoEventTextView = (TextView) findViewById(R.id.tangoevent);
-        mPoseStatusTextView = (TextView) findViewById(R.id.status);
-        mPointCountTextView = (TextView) findViewById(R.id.pointCount);
-        mTangoServiceVersionTextView = (TextView) findViewById(R.id.version);
-        mApplicationVersionTextView = (TextView) findViewById(R.id.appversion);
-        mAverageZTextView = (TextView) findViewById(R.id.averageZ);
-        mFrequencyTextView = (TextView) findViewById(R.id.frameDelta);
-
-        mFirstPersonButton = (Button) findViewById(R.id.first_person_button);
-        mFirstPersonButton.setOnClickListener(this);
-        mThirdPersonButton = (Button) findViewById(R.id.third_person_button);
-        mThirdPersonButton.setOnClickListener(this);
-        mTopDownButton = (Button) findViewById(R.id.top_down_button);
-        mTopDownButton.setOnClickListener(this);
         mTango = new Tango(this);
-        mConfig = new TangoConfig();
-        mConfig = mTango.getConfig(TangoConfig.CONFIG_TYPE_CURRENT);
-        mConfig.putBoolean(TangoConfig.KEY_BOOLEAN_DEPTH, true);
-
-        mTangoUx = new TangoUx.Builder(this).build();
-        mTangoUxLayout = (TangoUxLayout) findViewById(R.id.layout_tango);
-        mTangoUx = new TangoUx.Builder(this).setTangoUxLayout(mTangoUxLayout).build();
-        mTangoUx.setUxExceptionEventListener(mUxExceptionListener);
-
+        mConfig = setupTangoConfig(mTango);
+        setupTextViewsAndButtons(mConfig);
 
         int maxDepthPoints = mConfig.getInt("max_point_cloud_elements");
-        mRenderer = new PCRenderer(maxDepthPoints);
-        mGLView = (GLSurfaceView) findViewById(R.id.gl_surface_view);
-        mGLView.setEGLContextClientVersion(2);
-        mGLView.setRenderer(mRenderer);
-
-        PackageInfo packageInfo;
-        try {
-            packageInfo = this.getPackageManager().getPackageInfo(this.getPackageName(), 0);
-            mApplicationVersionTextView.setText(packageInfo.versionName);
-        } catch (NameNotFoundException e) {
-            e.printStackTrace();
-        }
-
-        // Display the version of Tango Service
-        mServiceVersion = mConfig.getString("tango_service_library_version");
-        mTangoServiceVersionTextView.setText(mServiceVersion);
+        mRenderer = setupGLViewAndRenderer();
+        mTangoUx = setupTangoUxAndLayout();
         mIsTangoServiceConnected = false;
-        startUIThread();
     }
 
     @Override
@@ -211,8 +130,10 @@ public class PointCloudActivity extends Activity implements OnClickListener {
         super.onPause();
         mTangoUx.stop();
         try {
+            mRenderer.getCurrentScene().clearFrameCallbacks();
             mTango.disconnect();
             mIsTangoServiceConnected = false;
+            mPose = null;
         } catch (TangoErrorException e) {
             Toast.makeText(getApplicationContext(), R.string.TangoError, Toast.LENGTH_SHORT).show();
         }
@@ -221,47 +142,31 @@ public class PointCloudActivity extends Activity implements OnClickListener {
     @Override
     protected void onResume() {
         super.onResume();
-        mTangoUx.start();
-        if (!mIsTangoServiceConnected) {
-            startActivityForResult(
-                    Tango.getRequestPermissionIntent(Tango.PERMISSIONTYPE_MOTION_TRACKING),
-                    Tango.TANGO_INTENT_ACTIVITYCODE);
+        StartParams params = new StartParams();
+        mTangoUx.start(params);
+        try {
+            setTangoListeners();
+            setRendererListener();
+        } catch (TangoErrorException e) {
+            Toast.makeText(this, R.string.TangoError, Toast.LENGTH_SHORT).show();
+        } catch (SecurityException e) {
+            Toast.makeText(getApplicationContext(), R.string.motiontrackingpermission,
+                    Toast.LENGTH_SHORT).show();
+        }
+        try {
+            mTango.connect(mConfig);
+            mPointCloudManager = new TangoPointCloudManager();
+            setupExtrinsics();
+            mIsTangoServiceConnected = true;
+        } catch (TangoOutOfDateException outDateEx) {
+            if (mTangoUx != null) {
+                mTangoUx.showTangoOutOfDate();
+            }
+        } catch (TangoErrorException e) {
+            Toast.makeText(getApplicationContext(), R.string.TangoError, Toast.LENGTH_SHORT)
+                    .show();
         }
         Log.i(TAG, "onResumed");
-    }
-
-    @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        // Check which request we're responding to
-        if (requestCode == Tango.TANGO_INTENT_ACTIVITYCODE) {
-            Log.i(TAG, "Triggered");
-            // Make sure the request was successful
-            if (resultCode == RESULT_CANCELED) {
-                Toast.makeText(this, R.string.motiontrackingpermission, Toast.LENGTH_LONG).show();
-                finish();
-                return;
-            }
-            try {
-                setTangoListeners();
-            } catch (TangoErrorException e) {
-                Toast.makeText(this, R.string.TangoError, Toast.LENGTH_SHORT).show();
-            } catch (SecurityException e) {
-                Toast.makeText(getApplicationContext(), R.string.motiontrackingpermission,
-                        Toast.LENGTH_SHORT).show();
-            }
-            try {
-                mTango.connect(mConfig);
-                mIsTangoServiceConnected = true;
-            } catch (TangoOutOfDateException outDateEx) {
-                if (mTangoUx != null) {
-                    mTangoUx.onTangoOutOfDate();
-                }
-            } catch (TangoErrorException e) {
-                Toast.makeText(getApplicationContext(), R.string.TangoError, Toast.LENGTH_SHORT)
-                        .show();
-            }
-            setUpExtrinsics();
-        }
     }
 
     @Override
@@ -283,120 +188,99 @@ public class PointCloudActivity extends Activity implements OnClickListener {
             break;
         default:
             Log.w(TAG, "Unrecognized button click.");
-            return;
         }
     }
 
     @Override
     public boolean onTouchEvent(MotionEvent event) {
-        return mRenderer.onTouchEvent(event);
-    }
-
-    private void setUpExtrinsics() {
-        // Set device to imu matrix in Model Matrix Calculator.
-        TangoPoseData device2IMUPose = new TangoPoseData();
-        TangoCoordinateFramePair framePair = new TangoCoordinateFramePair();
-        framePair.baseFrame = TangoPoseData.COORDINATE_FRAME_IMU;
-        framePair.targetFrame = TangoPoseData.COORDINATE_FRAME_DEVICE;
-        try {
-            device2IMUPose = mTango.getPoseAtTime(0.0, framePair);
-        } catch (TangoErrorException e) {
-            Toast.makeText(getApplicationContext(), R.string.TangoError, Toast.LENGTH_SHORT).show();
-        }
-        mRenderer.getModelMatCalculator().SetDevice2IMUMatrix(
-                device2IMUPose.getTranslationAsFloats(), device2IMUPose.getRotationAsFloats());
-
-        // Set color camera to imu matrix in Model Matrix Calculator.
-        TangoPoseData color2IMUPose = new TangoPoseData();
-
-        framePair.baseFrame = TangoPoseData.COORDINATE_FRAME_IMU;
-        framePair.targetFrame = TangoPoseData.COORDINATE_FRAME_CAMERA_COLOR;
-        try {
-            color2IMUPose = mTango.getPoseAtTime(0.0, framePair);
-        } catch (TangoErrorException e) {
-            Toast.makeText(getApplicationContext(), R.string.TangoError, Toast.LENGTH_SHORT).show();
-        }
-        mRenderer.getModelMatCalculator().SetColorCamera2IMUMatrix(
-                color2IMUPose.getTranslationAsFloats(), color2IMUPose.getRotationAsFloats());
+        mRenderer.onTouchEvent(event);
+        return true;
     }
 
     private void setTangoListeners() {
-        // Configure the Tango coordinate frame pair
-        final ArrayList<TangoCoordinateFramePair> framePairs = new ArrayList<TangoCoordinateFramePair>();
-        framePairs.add(new TangoCoordinateFramePair(
-                TangoPoseData.COORDINATE_FRAME_START_OF_SERVICE,
-                TangoPoseData.COORDINATE_FRAME_DEVICE));
         // Listen for new Tango data
-        mTango.connectListener(framePairs, new OnTangoUpdateListener() {
-
+        mTango.connectListener(FRAME_PAIRS, new OnTangoUpdateListener() {
             @Override
             public void onPoseAvailable(final TangoPoseData pose) {
                 // Passing in the pose data to UX library produce exceptions.
                 if (mTangoUx != null) {
                     mTangoUx.updatePoseStatus(pose.statusCode);
                 }
-                // Make sure to have atomic access to Tango Pose Data so that
-                // render loop doesn't interfere while Pose call back is updating
-                // the data.
-                synchronized (poseLock) {
+
+                // Update our copy of the latest pose
+                // Synchronize against concurrent use in the render loop.
+                synchronized (this) {
                     mPose = pose;
-                    // Calculate the delta time from previous pose.
-                    mDeltaTime = (float) (pose.timestamp - mPosePreviousTimeStamp)
-                            * SECS_TO_MILLISECS;
-                    mPosePreviousTimeStamp = (float) pose.timestamp;
-                    if (mPreviousPoseStatus != pose.statusCode) {
-                        count = 0;
-                    }
-                    count++;
-                    mPreviousPoseStatus = pose.statusCode;
-                    if(!mRenderer.isValid()){
-                        return;
-                    }
-                    mRenderer.getModelMatCalculator().updateModelMatrix(
-                            pose.getTranslationAsFloats(), pose.getRotationAsFloats());
+                }
+
+                // Calculate the delta time from previous pose.
+                final double deltaTime = (pose.timestamp - mPosePreviousTimeStamp)
+                        * SECS_TO_MILLISECS;
+                mPosePreviousTimeStamp = pose.timestamp;
+                if (mPreviousPoseStatus != pose.statusCode) {
+                    mCount = 0;
+                }
+                mCount++;
+                mPreviousPoseStatus = pose.statusCode;
+                mPoseTimeToNextUpdate -= deltaTime;
+
+                if (mPoseTimeToNextUpdate < 0.0) {
+                    mPoseTimeToNextUpdate = UPDATE_INTERVAL_MS;
+
+                    final String translationString
+                            = TangoPoseUtilities.getTranslationString(mPose, FORMAT_THREE_DECIMAL);
+                    final String quaternionString
+                            = TangoPoseUtilities.getQuaternionString(mPose, FORMAT_THREE_DECIMAL);
+                    final String status = TangoPoseUtilities.getStatusString(mPose);
+                    final String countString = Integer.toString(mCount);
+
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            mPoseTextView.setText(translationString);
+                            mQuatTextView.setText(quaternionString);
+                            mPoseCountTextView.setText(countString);
+                            mDeltaTextView.setText(FORMAT_THREE_DECIMAL.format(deltaTime));
+                            mPoseStatusTextView.setText(status);
+                        }
+                    });
                 }
             }
 
             @Override
             public void onXyzIjAvailable(final TangoXyzIjData xyzIj) {
-                if(mTangoUx!=null){
+                if (mTangoUx != null) {
                     mTangoUx.updateXyzCount(xyzIj.xyzCount);
                 }
-                // Make sure to have atomic access to TangoXyzIjData so that
-                // render loop doesn't interfere while onXYZijAvailable callback is updating
-                // the point cloud data.
-                synchronized (depthLock) {
-                    mCurrentTimeStamp = (float) xyzIj.timestamp;
-                    mPointCloudFrameDelta = (mCurrentTimeStamp - mXyIjPreviousTimeStamp)
-                            * SECS_TO_MILLISECS;
-                    mXyIjPreviousTimeStamp = mCurrentTimeStamp;
-                    try {
-                        TangoPoseData pointCloudPose = mTango.getPoseAtTime(mCurrentTimeStamp,
-                             framePairs.get(0));
-                        mPointCount = xyzIj.xyzCount;
-                        if(!mRenderer.isValid()){
-                            return;
+                mPointCloudManager.updateXyzIj(xyzIj);
+
+                final double currentTimeStamp = xyzIj.timestamp;
+                final double pointCloudFrameDelta = (currentTimeStamp - mXyIjPreviousTimeStamp)
+                        * SECS_TO_MILLISECS;
+                mXyIjPreviousTimeStamp = currentTimeStamp;
+                final double averageDepth = getAveragedDepth(xyzIj.xyz);
+
+                mXyzIjTimeToNextUpdate -= pointCloudFrameDelta;
+
+                if (mXyzIjTimeToNextUpdate < 0.0) {
+                    mXyzIjTimeToNextUpdate = UPDATE_INTERVAL_MS;
+                    final String pointCountString = Integer.toString(xyzIj.xyzCount);
+
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            mPointCountTextView.setText(pointCountString);
+                            mFrequencyTextView.setText(FORMAT_THREE_DECIMAL.format(pointCloudFrameDelta));
+                            mAverageZTextView.setText(FORMAT_THREE_DECIMAL.format(averageDepth));
                         }
-                        mRenderer.getPointCloud().UpdatePoints(xyzIj.xyz);
-                        mRenderer.getModelMatCalculator().updatePointCloudModelMatrix(
-                                        pointCloudPose.getTranslationAsFloats(),
-                                        pointCloudPose.getRotationAsFloats());
-                        mRenderer.getPointCloud().setModelMatrix(
-                                mRenderer.getModelMatCalculator().getPointCloudModelMatrixCopy());
-                      } catch (TangoErrorException e) {
-                        Toast.makeText(getApplicationContext(), R.string.TangoError,
-                                Toast.LENGTH_SHORT).show();
-                    } catch (TangoInvalidException e) {
-                        Toast.makeText(getApplicationContext(), R.string.TangoError,
-                                Toast.LENGTH_SHORT).show();
-                    }
+                    });
                 }
             }
 
             @Override
             public void onTangoEvent(final TangoEvent event) {
-                if(mTangoUx!=null){
-                    mTangoUx.onTangoEvent(event);
+                if (mTangoUx != null) {
+                    mTangoUx.updateTangoEvent(event);
                 }
                 runOnUiThread(new Runnable() {
                     @Override
@@ -413,68 +297,188 @@ public class PointCloudActivity extends Activity implements OnClickListener {
         });
     }
 
-    /**
-     * Create a separate thread to update Log information on UI at the specified interval of
-     * UPDATE_INTERVAL_MS. This function also makes sure to have access to the mPose atomically.
-     */
-    private void startUIThread() {
-        new Thread(new Runnable() {
-            final DecimalFormat threeDec = new DecimalFormat("0.000");
-
+    public void setRendererListener() {
+        mRenderer.getCurrentScene().registerFrameCallback(new ASceneFrameCallback() {
             @Override
-            public void run() {
-                while (true) {
-                    try {
-                        Thread.sleep(UPDATE_INTERVAL_MS);
-                        // Update the UI with TangoPose information
-                        runOnUiThread(new Runnable() {
-                            @Override
-                            public void run() {
-                                synchronized (poseLock) {
-                                    if (mPose == null) {
-                                        return;
-                                    }
-                                    String translationString = "["
-                                            + threeDec.format(mPose.translation[0]) + ", "
-                                            + threeDec.format(mPose.translation[1]) + ", "
-                                            + threeDec.format(mPose.translation[2]) + "] ";
-                                    String quaternionString = "["
-                                            + threeDec.format(mPose.rotation[0]) + ", "
-                                            + threeDec.format(mPose.rotation[1]) + ", "
-                                            + threeDec.format(mPose.rotation[2]) + ", "
-                                            + threeDec.format(mPose.rotation[3]) + "] ";
+            public void onPreFrame(long sceneTime, double deltaTime) {
+                // NOTE: This will be executed on each cycle before rendering, called from the
+                // OpenGL rendering thread
 
-                                    // Display pose data on screen in TextViews
-                                    mPoseTextView.setText(translationString);
-                                    mQuatTextView.setText(quaternionString);
-                                    mPoseCountTextView.setText(Integer.toString(count));
-                                    mDeltaTextView.setText(threeDec.format(mDeltaTime));
-                                    if (mPose.statusCode == TangoPoseData.POSE_VALID) {
-                                        mPoseStatusTextView.setText(R.string.pose_valid);
-                                    } else if (mPose.statusCode == TangoPoseData.POSE_INVALID) {
-                                        mPoseStatusTextView.setText(R.string.pose_invalid);
-                                    } else if (mPose.statusCode == TangoPoseData.POSE_INITIALIZING) {
-                                        mPoseStatusTextView.setText(R.string.pose_initializing);
-                                    } else if (mPose.statusCode == TangoPoseData.POSE_UNKNOWN) {
-                                        mPoseStatusTextView.setText(R.string.pose_unknown);
-                                    }
-                                }
-                                synchronized (depthLock) {
-                                    // Display number of points in the point cloud
-                                    mPointCountTextView.setText(Integer.toString(mPointCount));
-                                    mFrequencyTextView.setText(""
-                                            + threeDec.format(mPointCloudFrameDelta));
-                                    mAverageZTextView.setText(""
-                                            + threeDec.format(mRenderer.getPointCloud()
-                                                    .getAverageZ()));
-                                }
-                            }
-                        });
-                    } catch (InterruptedException e) {
-                        e.printStackTrace();
+                // Update point cloud data
+                TangoXyzIjData pointCloud = mPointCloudManager.getLatestXyzIj();
+                if (pointCloud != null && mIsTangoServiceConnected) {
+                    TangoPoseData pointCloudPose =
+                            mTango.getPoseAtTime(pointCloud.timestamp, FRAME_PAIRS.get(0));
+                    mRenderer.updatePointCloud(pointCloud, pointCloudPose);
+                }
+
+                // Update current device pose
+                synchronized (this) {
+                    if (mPose != null) {
+                        mRenderer.updateDevicePose(mPose);
                     }
                 }
             }
-        }).start();
+
+            @Override
+            public boolean callPreFrame() {
+                return true;
+            }
+
+            @Override
+            public void onPreDraw(long sceneTime, double deltaTime) {
+
+            }
+
+            @Override
+            public void onPostFrame(long sceneTime, double deltaTime) {
+
+            }
+        });
+    }
+
+    private void setupExtrinsics() {
+        TangoCoordinateFramePair framePair = new TangoCoordinateFramePair();
+        framePair.baseFrame = TangoPoseData.COORDINATE_FRAME_IMU;
+        framePair.targetFrame = TangoPoseData.COORDINATE_FRAME_CAMERA_COLOR;
+        TangoPoseData imuTColorCameraPose = mTango.getPoseAtTime(0.0,framePair);
+
+        framePair.targetFrame = TangoPoseData.COORDINATE_FRAME_CAMERA_DEPTH;
+        TangoPoseData imuTDepthCameraPose = mTango.getPoseAtTime(0.0,framePair);
+
+        framePair.targetFrame = TangoPoseData.COORDINATE_FRAME_DEVICE;
+        TangoPoseData imuTDevicePose = mTango.getPoseAtTime(0.0, framePair);
+
+        mRenderer.setupExtrinsics(imuTDevicePose, imuTColorCameraPose, imuTDepthCameraPose);
+    }
+
+    /*
+   * This is an advanced way of using UX exceptions. In most cases developers can just use the in
+   * built exception notifications using the Ux Exception layout. In case a developer doesn't want
+   * to use the default Ux Exception notifications, he can set the UxException listener as shown
+   * below.
+   * In this example we are just logging all the ux exceptions to logcat, but in a real app,
+   * developers should use these exceptions to contextually notify the user and help direct the
+   * user in using the device in a way Tango service expects it.
+   */
+    private UxExceptionEventListener mUxExceptionListener = new UxExceptionEventListener() {
+
+        @Override
+        public void onUxExceptionEvent(UxExceptionEvent uxExceptionEvent) {
+            if(uxExceptionEvent.getType() == UxExceptionEvent.TYPE_LYING_ON_SURFACE){
+                Log.i(TAG, "Device lying on surface ");
+            }
+            if(uxExceptionEvent.getType() == UxExceptionEvent.TYPE_FEW_DEPTH_POINTS){
+                Log.i(TAG, "Very few depth points in mPoint cloud " );
+            }
+            if(uxExceptionEvent.getType() == UxExceptionEvent.TYPE_FEW_FEATURES){
+                Log.i(TAG, "Invalid poses in MotionTracking ");
+            }
+            if(uxExceptionEvent.getType() == UxExceptionEvent.TYPE_INCOMPATIBLE_VM){
+                Log.i(TAG, "Device not running on ART");
+            }
+            if(uxExceptionEvent.getType() == UxExceptionEvent.TYPE_MOTION_TRACK_INVALID){
+                Log.i(TAG, "Invalid poses in MotionTracking ");
+            }
+            if(uxExceptionEvent.getType() == UxExceptionEvent.TYPE_MOVING_TOO_FAST){
+                Log.i(TAG, "Invalid poses in MotionTracking ");
+            }
+            if(uxExceptionEvent.getType() == UxExceptionEvent.TYPE_OVER_EXPOSED){
+                Log.i(TAG, "Camera Over Exposed");
+            }
+            if(uxExceptionEvent.getType() == UxExceptionEvent.TYPE_TANGO_SERVICE_NOT_RESPONDING){
+                Log.i(TAG, "TangoService is not responding ");
+            }
+            if(uxExceptionEvent.getType() == UxExceptionEvent.TYPE_UNDER_EXPOSED){
+                Log.i(TAG, "Camera Under Exposed " );
+            }
+
+        }
+    };
+
+    /**
+     * Sets up the tango configuration object. Make sure mTango object is initialized before
+     * making this call.
+     */
+    private TangoConfig setupTangoConfig(Tango tango) {
+        TangoConfig config = tango.getConfig(TangoConfig.CONFIG_TYPE_CURRENT);
+        config.putBoolean(TangoConfig.KEY_BOOLEAN_DEPTH, true);
+        return config;
+    }
+
+    /**
+     * Sets Text views to display statistics of Poses being received. This also sets the buttons
+     * used in the UI.
+     */
+    private void setupTextViewsAndButtons(TangoConfig config){
+        mPoseTextView = (TextView) findViewById(R.id.pose);
+        mQuatTextView = (TextView) findViewById(R.id.quat);
+        mPoseCountTextView = (TextView) findViewById(R.id.posecount);
+        mDeltaTextView = (TextView) findViewById(R.id.deltatime);
+        mTangoEventTextView = (TextView) findViewById(R.id.tangoevent);
+        mPoseStatusTextView = (TextView) findViewById(R.id.status);
+        mPointCountTextView = (TextView) findViewById(R.id.pointCount);
+        mTangoServiceVersionTextView = (TextView) findViewById(R.id.version);
+        mApplicationVersionTextView = (TextView) findViewById(R.id.appversion);
+        mAverageZTextView = (TextView) findViewById(R.id.averageZ);
+        mFrequencyTextView = (TextView) findViewById(R.id.frameDelta);
+
+        mFirstPersonButton = (Button) findViewById(R.id.first_person_button);
+        mFirstPersonButton.setOnClickListener(this);
+        mThirdPersonButton = (Button) findViewById(R.id.third_person_button);
+        mThirdPersonButton.setOnClickListener(this);
+        mTopDownButton = (Button) findViewById(R.id.top_down_button);
+        mTopDownButton.setOnClickListener(this);
+
+        PackageInfo packageInfo;
+        try {
+            packageInfo = this.getPackageManager().getPackageInfo(this.getPackageName(), 0);
+            mApplicationVersionTextView.setText(packageInfo.versionName);
+        } catch (NameNotFoundException e) {
+            e.printStackTrace();
+        }
+
+        // Display the version of Tango Service
+        String serviceVersion = config.getString("tango_service_library_version");
+        mTangoServiceVersionTextView.setText(serviceVersion);
+    }
+
+    /**
+     * Sets Rajawalisurface view and its renderer. This is ideally called only once in onCreate.
+     */
+    private PointCloudRajawaliRenderer setupGLViewAndRenderer(){
+        PointCloudRajawaliRenderer renderer = new PointCloudRajawaliRenderer(this);
+        RajawaliSurfaceView glView = (RajawaliSurfaceView) findViewById(R.id.gl_surface_view);
+        glView.setEGLContextClientVersion(2);
+        glView.setSurfaceRenderer(renderer);
+        return renderer;
+    }
+
+    /**
+     * Sets up TangoUX layout and sets its listener.
+     */
+    private TangoUx setupTangoUxAndLayout(){
+        TangoUxLayout uxLayout = (TangoUxLayout) findViewById(R.id.layout_tango);
+        TangoUx tangoUx = new TangoUx(this);
+        tangoUx.setLayout(uxLayout);
+        tangoUx.setUxExceptionEventListener(mUxExceptionListener);
+        return  tangoUx;
+    }
+
+    /**
+     * Calculates the average depth from a point cloud buffer
+     * @param pointCloudBuffer
+     * @return Average depth.
+     */
+    private float getAveragedDepth(FloatBuffer pointCloudBuffer){
+        int pointCount = pointCloudBuffer.capacity() / 3;
+        float totalZ = 0;
+        float averageZ = 0;
+        for (int i = 0; i < pointCloudBuffer.capacity() - 3; i = i + 3) {
+            totalZ = totalZ + pointCloudBuffer.get(i + 2);
+        }
+        if (pointCount != 0)
+            averageZ = totalZ / pointCount;
+        return  averageZ;
     }
 }
